@@ -36,6 +36,21 @@ jobs:
           set -o pipefail
           gradle build --stacktrace --no-daemon 2>&1 | tee build.log
 
+      - name: Client startup smoke test
+        shell: bash
+        run: |
+          set +e
+          timeout --signal=TERM 180s xvfb-run -a gradle runClient --no-daemon > client-smoke.log 2>&1
+          status=$?
+          cat client-smoke.log
+          if grep -Eqi 'Could not execute entrypoint|Minecraft has crashed|Minecraft Crash Report|NoClassDefFoundError|ClassNotFoundException' client-smoke.log; then
+            exit 1
+          fi
+          if [ "$status" -eq 0 ] || [ "$status" -eq 124 ]; then
+            exit 0
+          fi
+          exit "$status"
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -43,6 +58,14 @@ jobs:
           name: build-log
           path: build.log
           if-no-files-found: error
+
+      - name: Upload client smoke-test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-smoke-log
+          path: client-smoke.log
+          if-no-files-found: warn
 
       - name: Upload release JAR
         if: success()

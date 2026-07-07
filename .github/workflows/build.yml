@@ -10,7 +10,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,11 +32,11 @@ jobs:
           set -o pipefail
           gradle build --stacktrace --no-daemon 2>&1 | tee build.log
 
-      - name: Client startup smoke test
+      - name: Client startup test
         shell: bash
         run: |
           set +e
-          timeout --signal=TERM 180s xvfb-run -a gradle runClient --no-daemon > client-smoke.log 2>&1
+          timeout --signal=TERM 240s xvfb-run -a gradle runClient --no-daemon > client-smoke.log 2>&1
           status=$?
           cat client-smoke.log
           if grep -Eqi 'Could not execute entrypoint|Minecraft has crashed|Minecraft Crash Report|NoClassDefFoundError|ClassNotFoundException' client-smoke.log; then
@@ -55,7 +55,7 @@ jobs:
           path: build.log
           if-no-files-found: error
 
-      - name: Upload client smoke-test log
+      - name: Upload client log
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -68,5 +68,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-assist-client-26.1.2
-          path: build/libs/build-assist-client-1.3.0+26.1.2.jar
+          path: build/libs/build-assist-client-2.0.0+26.1.2.jar
           if-no-files-found: error

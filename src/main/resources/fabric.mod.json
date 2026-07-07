@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "buildassist",
+  "version": "${version}",
+  "name": "Build Assist Client",
+  "description": "Client-side building assistance with advanced shapes, radial mode selection and optional Litematica integration for Minecraft 26.1.2.",
+  "authors": ["syun"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.syun.buildassist.BuildAssistClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "=26.1.2",
+    "fabric-api": ">=0.153.0",
+    "java": ">=25"
+  },
+  "suggests": {
+    "litematica": ">=0.27.5",
+    "malilib": ">=0.28.5"
+  }
+}

@@ -10,32 +10,12 @@ base {
 }
 
 repositories {
-    exclusiveContent {
-        forRepository {
-            maven {
-                name = "Modrinth"
-                url = "https://api.modrinth.com/maven"
-                metadataSources {
-                    mavenPom()
-                    artifact()
-                }
-            }
-        }
-        filter {
-            includeGroup "maven.modrinth"
-        }
-    }
 }
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-
-    // Runtime-only integration test dependencies. Build Assist accesses these
-    // through reflection, so they are not bundled into the release JAR.
-    runtimeOnly "maven.modrinth:GcWjdA9I:pvxtUnf1"
-    runtimeOnly "maven.modrinth:bEpr0Arc:L3jEEEAe"
 }
 
 processResources {

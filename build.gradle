@@ -29,9 +29,9 @@ dependencies {
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
     // Runtime-only integration test dependencies. Build Assist accesses these
-    // through reflection, so the release JAR still works without Litematica.
-    modRuntimeOnly "maven.modrinth:GcWjdA9I:pvxtUnf1"
-    modRuntimeOnly "maven.modrinth:bEpr0Arc:L3jEEEAe"
+    // through reflection, so they are not bundled into the release JAR.
+    runtimeOnly "maven.modrinth:GcWjdA9I:pvxtUnf1"
+    runtimeOnly "maven.modrinth:bEpr0Arc:L3jEEEAe"
 }
 
 processResources {

@@ -1,8 +1,8 @@
 package com.syun.buildassist;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
+import java.util.Comparator;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -53,8 +53,17 @@ public final class BuildAssistClient implements ClientModInitializer {
 
     private static final int MAX_BLOCKS_PER_ACTION = 1024;
     private static final int MAX_RENDERED_QUEUED_BLOCKS = 256;
-    private static final int MAX_RETRY_COUNT = 80;
     private static final int PLACE_INTERVAL_TICKS = 2;
+    private static final int FAILED_RETRY_DELAY_TICKS = 20;
+
+    /**
+     * The server ultimately decides whether a normal block-use packet is close
+     * enough. A client-only mod cannot remove that check, so positions outside
+     * this conservative range stay queued until the player approaches them.
+     */
+    private static final double MAX_PLACEMENT_REACH = 4.5D;
+    private static final double MAX_PLACEMENT_REACH_SQR =
+            MAX_PLACEMENT_REACH * MAX_PLACEMENT_REACH;
 
     private static final int COLOR_PANEL = 0xB0000000;
     private static final int COLOR_TEXT = 0xFFFFFFFF;
@@ -62,10 +71,11 @@ public final class BuildAssistClient implements ClientModInitializer {
     private static final int COLOR_WARNING = 0xFFFFAA00;
 
     private static final int COLOR_START = ARGB.colorFromFloat(0.42f, 0.15f, 1.00f, 0.20f);
-    private static final int COLOR_END = ARGB.colorFromFloat(0.42f, 1.00f, 0.22f, 0.15f);
-    private static final int COLOR_PREVIEW = ARGB.colorFromFloat(0.20f, 0.05f, 0.78f, 1.00f);
-    private static final int COLOR_QUEUED = ARGB.colorFromFloat(0.16f, 1.00f, 0.60f, 0.05f);
-    private static final int COLOR_INVALID = ARGB.colorFromFloat(0.38f, 1.00f, 0.05f, 0.05f);
+    private static final int COLOR_END = ARGB.colorFromFloat(0.42f, 0.15f, 0.85f, 1.00f);
+    private static final int COLOR_READY = ARGB.colorFromFloat(0.22f, 0.10f, 1.00f, 0.20f);
+    private static final int COLOR_OUT_OF_RANGE = ARGB.colorFromFloat(0.30f, 1.00f, 0.08f, 0.08f);
+    private static final int COLOR_WAITING_SUPPORT = ARGB.colorFromFloat(0.28f, 1.00f, 0.72f, 0.05f);
+    private static final int COLOR_INVALID = ARGB.colorFromFloat(0.42f, 0.65f, 0.00f, 0.00f);
 
     private static KeyMapping toggleKey;
     private static KeyMapping modeKey;
@@ -176,7 +186,7 @@ public final class BuildAssistClient implements ClientModInitializer {
         if (queued <= 0) {
             setStatus("設置対象がありません", 100);
         } else {
-            setStatus(queued + "ブロックを設置キューに追加しました", 100);
+            setStatus(queued + "ブロックを設置待ちに追加しました", 100);
         }
         return InteractionResult.FAIL;
     }
@@ -200,8 +210,14 @@ public final class BuildAssistClient implements ClientModInitializer {
             lines.add("始点を右クリック");
         }
 
-        if (PLACEMENT_QUEUE.remainingCount() > 0) {
-            lines.add("設置待ち: " + PLACEMENT_QUEUE.remainingCount());
+        QueueStats stats = PLACEMENT_QUEUE.getStats();
+        if (stats.remaining() > 0) {
+            lines.add("未設置: " + stats.remaining());
+            lines.add("現在設置可能: " + stats.ready());
+            lines.add("範囲外: " + stats.outOfRange());
+            if (stats.waitingSupport() > 0) {
+                lines.add("支え待ち: " + stats.waitingSupport());
+            }
         }
 
         boolean showStatus = !statusMessage.isEmpty() && clientTicks <= statusUntilTick;
@@ -212,7 +228,7 @@ public final class BuildAssistClient implements ClientModInitializer {
         int x = 6;
         int y = 6;
         int lineHeight = client.font.lineHeight + 2;
-        int width = 130;
+        int width = 145;
         for (String line : lines) {
             width = Math.max(width, client.font.width(line) + 12);
         }
@@ -236,7 +252,7 @@ public final class BuildAssistClient implements ClientModInitializer {
 
         BlockPos hover = getHoveredPlacementPos(client);
         BlockPos start = PLACEMENT_QUEUE.getStart();
-        List<BlockPos> queued = PLACEMENT_QUEUE.queuedSnapshot(MAX_RENDERED_QUEUED_BLOCKS);
+        List<BlockPos> queued = PLACEMENT_QUEUE.queuedSnapshot(client, MAX_RENDERED_QUEUED_BLOCKS);
 
         if (hover == null && start == null && queued.isEmpty()) {
             return;
@@ -250,7 +266,14 @@ public final class BuildAssistClient implements ClientModInitializer {
         poseStack.translate(-camera.x, -camera.y, -camera.z);
 
         for (BlockPos pos : queued) {
-            drawFilledBox(poseStack, consumer, slightlyInsetBox(pos, 0.035), COLOR_QUEUED);
+            PlacementState state = classifyPlacement(client, pos);
+            if (state != PlacementState.FILLED) {
+                drawFilledBox(
+                        poseStack,
+                        consumer,
+                        slightlyInsetBox(pos, 0.035),
+                        colorForPlacementState(state));
+            }
         }
 
         if (start != null) {
@@ -258,27 +281,73 @@ public final class BuildAssistClient implements ClientModInitializer {
         }
 
         if (hover != null) {
-            boolean replaceable = client.level.getBlockState(hover).canBeReplaced();
-            drawFilledBox(
-                    poseStack,
-                    consumer,
-                    slightlyInsetBox(hover, 0.012),
-                    replaceable ? COLOR_END : COLOR_INVALID);
+            PlacementState hoverState = classifyPlacement(client, hover);
+            int hoverColor = switch (hoverState) {
+                case READY -> COLOR_END;
+                case OUT_OF_RANGE -> COLOR_OUT_OF_RANGE;
+                case WAITING_SUPPORT -> COLOR_WAITING_SUPPORT;
+                case FILLED -> COLOR_INVALID;
+            };
+            drawFilledBox(poseStack, consumer, slightlyInsetBox(hover, 0.012), hoverColor);
         }
 
         if (start != null && hover != null && client.level.getBlockState(hover).canBeReplaced()) {
-            if (currentMode == BuildMode.AREA) {
-                drawFilledBox(poseStack, consumer, areaBox(start, hover, 0.045), COLOR_PREVIEW);
-            } else if (currentMode == BuildMode.LINE) {
-                List<BlockPos> preview = PlacementQueue.createLine(start, hover);
-                int renderLimit = Math.min(preview.size(), MAX_RENDERED_QUEUED_BLOCKS);
-                for (int i = 0; i < renderLimit; i++) {
-                    drawFilledBox(poseStack, consumer, slightlyInsetBox(preview.get(i), 0.06), COLOR_PREVIEW);
+            List<BlockPos> preview = currentMode == BuildMode.AREA
+                    ? PlacementQueue.createArea(start, hover)
+                    : PlacementQueue.createLine(start, hover);
+
+            int renderLimit = Math.min(preview.size(), MAX_RENDERED_QUEUED_BLOCKS);
+            for (int i = 0; i < renderLimit; i++) {
+                BlockPos pos = preview.get(i);
+                PlacementState state = classifyPlacement(client, pos);
+                if (state != PlacementState.FILLED) {
+                    drawFilledBox(
+                            poseStack,
+                            consumer,
+                            slightlyInsetBox(pos, 0.06),
+                            colorForPlacementState(state));
                 }
             }
         }
 
         poseStack.popPose();
+    }
+
+    private static int colorForPlacementState(PlacementState state) {
+        return switch (state) {
+            case READY -> COLOR_READY;
+            case OUT_OF_RANGE -> COLOR_OUT_OF_RANGE;
+            case WAITING_SUPPORT -> COLOR_WAITING_SUPPORT;
+            case FILLED -> COLOR_INVALID;
+        };
+    }
+
+    private static PlacementState classifyPlacement(Minecraft client, BlockPos targetPos) {
+        LocalPlayer player = client.player;
+        ClientLevel level = client.level;
+        if (player == null || level == null) {
+            return PlacementState.WAITING_SUPPORT;
+        }
+
+        if (!level.getBlockState(targetPos).canBeReplaced()) {
+            return PlacementState.FILLED;
+        }
+
+        BlockHitResult hitResult = createPlacementHitResult(level, targetPos);
+        if (hitResult == null) {
+            return PlacementState.WAITING_SUPPORT;
+        }
+
+        if (!isWithinPlacementReach(player, hitResult)) {
+            return PlacementState.OUT_OF_RANGE;
+        }
+
+        return PlacementState.READY;
+    }
+
+    private static boolean isWithinPlacementReach(LocalPlayer player, BlockHitResult hitResult) {
+        return player.getEyePosition().distanceToSqr(hitResult.getLocation())
+                <= MAX_PLACEMENT_REACH_SQR;
     }
 
     private static BlockPos getHoveredPlacementPos(Minecraft client) {
@@ -298,22 +367,6 @@ public final class BuildAssistClient implements ClientModInitializer {
                 pos.getX() + 1.0 - inset,
                 pos.getY() + 1.0 - inset,
                 pos.getZ() + 1.0 - inset);
-    }
-
-    private static AABB areaBox(BlockPos first, BlockPos second, double inset) {
-        int minX = Math.min(first.getX(), second.getX());
-        int minY = Math.min(first.getY(), second.getY());
-        int minZ = Math.min(first.getZ(), second.getZ());
-        int maxX = Math.max(first.getX(), second.getX());
-        int maxY = Math.max(first.getY(), second.getY());
-        int maxZ = Math.max(first.getZ(), second.getZ());
-        return new AABB(
-                minX + inset,
-                minY + inset,
-                minZ + inset,
-                maxX + 1.0 - inset,
-                maxY + 1.0 - inset,
-                maxZ + 1.0 - inset);
     }
 
     private static void drawFilledBox(PoseStack poseStack, VertexConsumer vertexConsumer, AABB box, int color) {
@@ -379,15 +432,31 @@ public final class BuildAssistClient implements ClientModInitializer {
         }
     }
 
+    private enum PlacementState {
+        READY,
+        OUT_OF_RANGE,
+        WAITING_SUPPORT,
+        FILLED
+    }
+
     private enum PlaceResult {
         SUCCESS,
         RETRY,
         SKIP
     }
 
+    private record QueueStats(
+            int remaining,
+            int ready,
+            int outOfRange,
+            int waitingSupport) {
+
+        private static final QueueStats EMPTY = new QueueStats(0, 0, 0, 0);
+    }
+
     private static final class QueuedPlacement {
         private final BlockPos pos;
-        private int retries;
+        private long retryAfterTick;
 
         private QueuedPlacement(BlockPos pos) {
             this.pos = pos.immutable();
@@ -395,9 +464,10 @@ public final class BuildAssistClient implements ClientModInitializer {
     }
 
     private static final class PlacementQueue {
-        private final Deque<QueuedPlacement> queue = new ArrayDeque<>();
+        private final List<QueuedPlacement> queue = new ArrayList<>();
         private BlockPos start;
         private long nextPlacementTick;
+        private QueueStats stats = QueueStats.EMPTY;
 
         private void setStart(BlockPos pos) {
             start = pos.immutable();
@@ -423,11 +493,12 @@ public final class BuildAssistClient implements ClientModInitializer {
             queue.clear();
             int limit = Math.min(shape.size(), MAX_BLOCKS_PER_ACTION);
             for (int i = 0; i < limit; i++) {
-                queue.addLast(new QueuedPlacement(shape.get(i)));
+                queue.add(new QueuedPlacement(shape.get(i)));
             }
 
             start = null;
             nextPlacementTick = clientTicks;
+            stats = new QueueStats(queue.size(), 0, 0, queue.size());
             return limit;
         }
 
@@ -439,29 +510,44 @@ public final class BuildAssistClient implements ClientModInitializer {
             start = null;
             queue.clear();
             nextPlacementTick = 0;
+            stats = QueueStats.EMPTY;
         }
 
-        private int remainingCount() {
-            return queue.size();
+        private QueueStats getStats() {
+            return stats;
         }
 
-        private List<BlockPos> queuedSnapshot(int limit) {
+        private List<BlockPos> queuedSnapshot(Minecraft client, int limit) {
+            if (client.player == null || queue.isEmpty()) {
+                return List.of();
+            }
+
+            Vec3 eyePosition = client.player.getEyePosition();
+            List<QueuedPlacement> sorted = new ArrayList<>(queue);
+            sorted.sort(Comparator.comparingDouble(
+                    placement -> eyePosition.distanceToSqr(Vec3.atCenterOf(placement.pos))));
+
             List<BlockPos> positions = new ArrayList<>();
-            int count = 0;
-            for (QueuedPlacement placement : queue) {
-                positions.add(placement.pos);
-                count++;
-                if (count >= limit) {
-                    break;
-                }
+            int renderLimit = Math.min(sorted.size(), limit);
+            for (int i = 0; i < renderLimit; i++) {
+                positions.add(sorted.get(i).pos);
             }
             return positions;
         }
 
         private void tick(Minecraft client) {
-            if (client.player == null || client.level == null || client.gameMode == null || queue.isEmpty()) {
+            if (client.player == null || client.level == null || client.gameMode == null) {
+                stats = QueueStats.EMPTY;
                 return;
             }
+
+            cleanupCompleted(client.level);
+            refreshStats(client);
+
+            if (queue.isEmpty()) {
+                return;
+            }
+
             if (clientTicks < nextPlacementTick) {
                 return;
             }
@@ -473,21 +559,92 @@ public final class BuildAssistClient implements ClientModInitializer {
                 return;
             }
 
-            QueuedPlacement placement = queue.removeFirst();
-            PlaceResult result = tryPlaceBlock(client, placement.pos);
-
-            if (result == PlaceResult.RETRY) {
-                placement.retries++;
-                if (placement.retries <= MAX_RETRY_COUNT) {
-                    queue.addLast(placement);
-                }
+            QueuedPlacement placement = findNearestReadyPlacement(client);
+            if (placement == null) {
+                // Out-of-range and unsupported blocks are deliberately retained.
+                // Moving closer or creating support makes placement resume automatically.
+                nextPlacementTick = clientTicks + PLACE_INTERVAL_TICKS;
+                return;
             }
 
+            PlaceResult result = tryPlaceBlock(client, placement.pos);
+            if (result == PlaceResult.SUCCESS || result == PlaceResult.SKIP) {
+                queue.remove(placement);
+            } else {
+                placement.retryAfterTick = clientTicks + FAILED_RETRY_DELAY_TICKS;
+            }
+
+            cleanupCompleted(client.level);
+            refreshStats(client);
             nextPlacementTick = clientTicks + PLACE_INTERVAL_TICKS;
 
             if (queue.isEmpty()) {
                 setStatus("設置処理が完了しました", 80);
             }
+        }
+
+        private void cleanupCompleted(ClientLevel level) {
+            Iterator<QueuedPlacement> iterator = queue.iterator();
+            while (iterator.hasNext()) {
+                QueuedPlacement placement = iterator.next();
+                if (!level.getBlockState(placement.pos).canBeReplaced()) {
+                    iterator.remove();
+                }
+            }
+        }
+
+        private void refreshStats(Minecraft client) {
+            int ready = 0;
+            int outOfRange = 0;
+            int waitingSupport = 0;
+
+            for (QueuedPlacement placement : queue) {
+                PlacementState state = classifyPlacement(client, placement.pos);
+                switch (state) {
+                    case READY -> ready++;
+                    case OUT_OF_RANGE -> outOfRange++;
+                    case WAITING_SUPPORT -> waitingSupport++;
+                    case FILLED -> {
+                        // Removed by cleanupCompleted before this scan.
+                    }
+                }
+            }
+
+            stats = new QueueStats(queue.size(), ready, outOfRange, waitingSupport);
+        }
+
+        private QueuedPlacement findNearestReadyPlacement(Minecraft client) {
+            LocalPlayer player = client.player;
+            ClientLevel level = client.level;
+            if (player == null || level == null) {
+                return null;
+            }
+
+            Vec3 eyePosition = player.getEyePosition();
+            QueuedPlacement nearest = null;
+            double nearestDistanceSqr = Double.MAX_VALUE;
+
+            for (QueuedPlacement placement : queue) {
+                if (placement.retryAfterTick > clientTicks) {
+                    continue;
+                }
+                if (!level.getBlockState(placement.pos).canBeReplaced()) {
+                    continue;
+                }
+
+                BlockHitResult hitResult = createPlacementHitResult(level, placement.pos);
+                if (hitResult == null || !isWithinPlacementReach(player, hitResult)) {
+                    continue;
+                }
+
+                double distanceSqr = eyePosition.distanceToSqr(hitResult.getLocation());
+                if (distanceSqr < nearestDistanceSqr) {
+                    nearestDistanceSqr = distanceSqr;
+                    nearest = placement;
+                }
+            }
+
+            return nearest;
         }
 
         private static List<BlockPos> createLine(BlockPos start, BlockPos end) {
@@ -548,7 +705,7 @@ public final class BuildAssistClient implements ClientModInitializer {
         }
 
         BlockHitResult placementHit = createPlacementHitResult(level, targetPos);
-        if (placementHit == null) {
+        if (placementHit == null || !isWithinPlacementReach(player, placementHit)) {
             return PlaceResult.RETRY;
         }
 

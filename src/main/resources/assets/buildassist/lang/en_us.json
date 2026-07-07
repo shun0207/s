@@ -1,4 +1,5 @@
 {
   "key.buildassist.toggle": "Toggle BuildAssist",
-  "key.buildassist.mode": "Switch build mode (Line / Area)"
+  "key.buildassist.mode": "Switch to the next build mode",
+  "key.buildassist.radial": "Open radial build mode menu"
 }

@@ -2,32 +2,41 @@ package com.syun.buildassist;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
 
 import com.mojang.blaze3d.platform.InputConstants;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.VertexConsumer;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.ARGB;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -35,21 +44,40 @@ import net.minecraft.world.phys.Vec3;
 /**
  * Minecraft 26.1.2 / Fabric client-only building assistant.
  *
- * <p>B toggles the mod. M cycles NONE -> LINE -> AREA. While a mode is active,
- * right-click a block face once to set the first position and once more to queue
- * the selected shape. Placement uses ordinary vanilla client interaction packets,
- * so the server does not need this mod.</p>
+ * <p>B toggles the mod. M cycles NONE -> LINE -> AREA. Right-click a block
+ * face once to choose the start and again to choose the end. Placement uses
+ * normal vanilla client interactions, so the server does not need this mod.</p>
  */
 public final class BuildAssistClient implements ClientModInitializer {
-    private static final int BLOCKS_PER_TICK = 3;
+    private static final Identifier HUD_ID = Identifier.fromNamespaceAndPath("buildassist", "status_hud");
+
     private static final int MAX_BLOCKS_PER_ACTION = 1024;
+    private static final int MAX_RENDERED_QUEUED_BLOCKS = 256;
+    private static final int MAX_RETRY_COUNT = 80;
+    private static final int PLACE_INTERVAL_TICKS = 2;
+
+    private static final int COLOR_PANEL = 0xB0000000;
+    private static final int COLOR_TEXT = 0xFFFFFFFF;
+    private static final int COLOR_ENABLED = 0xFF55FF55;
+    private static final int COLOR_WARNING = 0xFFFFAA00;
+
+    private static final int COLOR_START = ARGB.colorFromFloat(0.42f, 0.15f, 1.00f, 0.20f);
+    private static final int COLOR_END = ARGB.colorFromFloat(0.42f, 1.00f, 0.22f, 0.15f);
+    private static final int COLOR_PREVIEW = ARGB.colorFromFloat(0.20f, 0.05f, 0.78f, 1.00f);
+    private static final int COLOR_QUEUED = ARGB.colorFromFloat(0.16f, 1.00f, 0.60f, 0.05f);
+    private static final int COLOR_INVALID = ARGB.colorFromFloat(0.38f, 1.00f, 0.05f, 0.05f);
 
     private static KeyMapping toggleKey;
     private static KeyMapping modeKey;
 
     private static boolean enabled;
+    private static boolean internalPlacement;
     private static BuildMode currentMode = BuildMode.NONE;
     private static final PlacementQueue PLACEMENT_QUEUE = new PlacementQueue();
+
+    private static long clientTicks;
+    private static String statusMessage = "";
+    private static long statusUntilTick;
 
     @Override
     public void onInitializeClient() {
@@ -67,29 +95,33 @@ public final class BuildAssistClient implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(BuildAssistClient::onEndClientTick);
         UseBlockCallback.EVENT.register(BuildAssistClient::onUseBlock);
+        HudElementRegistry.addLast(HUD_ID, BuildAssistClient::renderHud);
+        LevelRenderEvents.BEFORE_TRANSLUCENT_TERRAIN.register(BuildAssistClient::renderWorldPreview);
     }
 
     private static void onEndClientTick(Minecraft client) {
+        clientTicks++;
+
         while (toggleKey.consumeClick()) {
             enabled = !enabled;
 
             if (!enabled) {
                 currentMode = BuildMode.NONE;
                 PLACEMENT_QUEUE.clear();
+                setStatus("BuildAssistをOFFにしました", 60);
+            } else {
+                setStatus("BuildAssistをONにしました", 60);
             }
-
-            sendActionBar(client, "BuildAssist: " + (enabled ? "ON" : "OFF"));
         }
 
         while (modeKey.consumeClick()) {
             if (!enabled) {
                 enabled = true;
-                sendActionBar(client, "BuildAssist: ON");
             }
 
             currentMode = currentMode.next();
-            PLACEMENT_QUEUE.clear();
-            sendActionBar(client, "Mode: " + currentMode.displayName);
+            PLACEMENT_QUEUE.clearSelection();
+            setStatus("モード: " + currentMode.displayName, 60);
         }
 
         if (enabled && currentMode != BuildMode.NONE) {
@@ -102,6 +134,13 @@ public final class BuildAssistClient implements ClientModInitializer {
             net.minecraft.world.level.Level level,
             InteractionHand hand,
             BlockHitResult hitResult) {
+
+        // MultiPlayerGameMode#useItemOn also invokes this callback. Without this
+        // guard, our own automatic placement is interpreted as a new selection
+        // click and is cancelled with FAIL before a packet can be sent.
+        if (internalPlacement) {
+            return InteractionResult.PASS;
+        }
 
         if (!level.isClientSide()
                 || hand != InteractionHand.MAIN_HAND
@@ -117,32 +156,203 @@ public final class BuildAssistClient implements ClientModInitializer {
 
         ItemStack heldStack = player.getItemInHand(hand);
         if (!(heldStack.getItem() instanceof BlockItem)) {
-            sendActionBar(client, "BuildAssist: ブロックを手に持ってください");
+            setStatus("ブロックをメインハンドに持ってください", 100);
             return InteractionResult.FAIL;
         }
 
         BlockPos targetPos = hitResult.getBlockPos().relative(hitResult.getDirection()).immutable();
-        BlockState targetState = level.getBlockState(targetPos);
-        if (!targetState.canBeReplaced()) {
-            sendActionBar(client, "BuildAssist: 指定位置には設置できません");
+        if (!level.getBlockState(targetPos).canBeReplaced()) {
+            setStatus("その位置は置き換えできません", 100);
             return InteractionResult.FAIL;
         }
 
         if (!PLACEMENT_QUEUE.hasStart()) {
             PLACEMENT_QUEUE.setStart(targetPos);
-            sendActionBar(client, "Start: " + formatPos(targetPos));
+            setStatus("始点: " + formatPos(targetPos) + " / 終点を右クリック", 120);
             return InteractionResult.FAIL;
         }
 
         int queued = PLACEMENT_QUEUE.setEnd(targetPos, currentMode);
-        sendActionBar(client, "Queued: " + queued + " blocks");
+        if (queued <= 0) {
+            setStatus("設置対象がありません", 100);
+        } else {
+            setStatus(queued + "ブロックを設置キューに追加しました", 100);
+        }
         return InteractionResult.FAIL;
     }
 
-    private static void sendActionBar(Minecraft client, String message) {
-        if (client.player != null) {
-            client.player.displayClientMessage(Component.literal(message), true);
+    private static void renderHud(GuiGraphicsExtractor graphics, net.minecraft.client.DeltaTracker deltaTracker) {
+        Minecraft client = Minecraft.getInstance();
+        if (client.player == null || !enabled) {
+            return;
         }
+
+        List<String> lines = new ArrayList<>();
+        lines.add("BuildAssist: ON");
+        lines.add("モード: " + currentMode.displayName);
+
+        if (currentMode == BuildMode.NONE) {
+            lines.add("Mキーでモードを選択");
+        } else if (PLACEMENT_QUEUE.hasStart()) {
+            lines.add("始点: " + formatPos(PLACEMENT_QUEUE.getStart()));
+            lines.add("終点を右クリック");
+        } else {
+            lines.add("始点を右クリック");
+        }
+
+        if (PLACEMENT_QUEUE.remainingCount() > 0) {
+            lines.add("設置待ち: " + PLACEMENT_QUEUE.remainingCount());
+        }
+
+        boolean showStatus = !statusMessage.isEmpty() && clientTicks <= statusUntilTick;
+        if (showStatus) {
+            lines.add(statusMessage);
+        }
+
+        int x = 6;
+        int y = 6;
+        int lineHeight = client.font.lineHeight + 2;
+        int width = 130;
+        for (String line : lines) {
+            width = Math.max(width, client.font.width(line) + 12);
+        }
+        int height = lines.size() * lineHeight + 8;
+
+        graphics.fill(x, y, x + width, y + height, COLOR_PANEL);
+        for (int i = 0; i < lines.size(); i++) {
+            int color = i == 0 ? COLOR_ENABLED : COLOR_TEXT;
+            if (showStatus && i == lines.size() - 1) {
+                color = COLOR_WARNING;
+            }
+            graphics.text(client.font, lines.get(i), x + 6, y + 5 + i * lineHeight, color);
+        }
+    }
+
+    private static void renderWorldPreview(LevelRenderContext context) {
+        Minecraft client = Minecraft.getInstance();
+        if (!enabled || currentMode == BuildMode.NONE || client.level == null || client.player == null) {
+            return;
+        }
+
+        BlockPos hover = getHoveredPlacementPos(client);
+        BlockPos start = PLACEMENT_QUEUE.getStart();
+        List<BlockPos> queued = PLACEMENT_QUEUE.queuedSnapshot(MAX_RENDERED_QUEUED_BLOCKS);
+
+        if (hover == null && start == null && queued.isEmpty()) {
+            return;
+        }
+
+        Vec3 camera = context.levelState().cameraRenderState.pos;
+        PoseStack poseStack = context.poseStack();
+        VertexConsumer consumer = context.bufferSource().getBuffer(RenderTypes.debugFilledBox());
+
+        poseStack.pushPose();
+        poseStack.translate(-camera.x, -camera.y, -camera.z);
+
+        for (BlockPos pos : queued) {
+            drawFilledBox(poseStack, consumer, slightlyInsetBox(pos, 0.035), COLOR_QUEUED);
+        }
+
+        if (start != null) {
+            drawFilledBox(poseStack, consumer, slightlyInsetBox(start, 0.018), COLOR_START);
+        }
+
+        if (hover != null) {
+            boolean replaceable = client.level.getBlockState(hover).canBeReplaced();
+            drawFilledBox(
+                    poseStack,
+                    consumer,
+                    slightlyInsetBox(hover, 0.012),
+                    replaceable ? COLOR_END : COLOR_INVALID);
+        }
+
+        if (start != null && hover != null && client.level.getBlockState(hover).canBeReplaced()) {
+            if (currentMode == BuildMode.AREA) {
+                drawFilledBox(poseStack, consumer, areaBox(start, hover, 0.045), COLOR_PREVIEW);
+            } else if (currentMode == BuildMode.LINE) {
+                List<BlockPos> preview = PlacementQueue.createLine(start, hover);
+                int renderLimit = Math.min(preview.size(), MAX_RENDERED_QUEUED_BLOCKS);
+                for (int i = 0; i < renderLimit; i++) {
+                    drawFilledBox(poseStack, consumer, slightlyInsetBox(preview.get(i), 0.06), COLOR_PREVIEW);
+                }
+            }
+        }
+
+        poseStack.popPose();
+    }
+
+    private static BlockPos getHoveredPlacementPos(Minecraft client) {
+        HitResult hit = client.hitResult;
+        if (!(hit instanceof BlockHitResult blockHitResult)
+                || blockHitResult.getType() == HitResult.Type.MISS) {
+            return null;
+        }
+        return blockHitResult.getBlockPos().relative(blockHitResult.getDirection()).immutable();
+    }
+
+    private static AABB slightlyInsetBox(BlockPos pos, double inset) {
+        return new AABB(
+                pos.getX() + inset,
+                pos.getY() + inset,
+                pos.getZ() + inset,
+                pos.getX() + 1.0 - inset,
+                pos.getY() + 1.0 - inset,
+                pos.getZ() + 1.0 - inset);
+    }
+
+    private static AABB areaBox(BlockPos first, BlockPos second, double inset) {
+        int minX = Math.min(first.getX(), second.getX());
+        int minY = Math.min(first.getY(), second.getY());
+        int minZ = Math.min(first.getZ(), second.getZ());
+        int maxX = Math.max(first.getX(), second.getX());
+        int maxY = Math.max(first.getY(), second.getY());
+        int maxZ = Math.max(first.getZ(), second.getZ());
+        return new AABB(
+                minX + inset,
+                minY + inset,
+                minZ + inset,
+                maxX + 1.0 - inset,
+                maxY + 1.0 - inset,
+                maxZ + 1.0 - inset);
+    }
+
+    private static void drawFilledBox(PoseStack poseStack, VertexConsumer vertexConsumer, AABB box, int color) {
+        Matrix4f matrix = poseStack.last().pose();
+
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.minY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.minY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.maxY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.maxY, (float) box.minZ).setColor(color);
+
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.minY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.minY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.maxY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.maxY, (float) box.maxZ).setColor(color);
+
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.minY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.minY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.maxY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.maxY, (float) box.maxZ).setColor(color);
+
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.minY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.minY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.maxY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.maxY, (float) box.minZ).setColor(color);
+
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.maxY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.maxY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.maxY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.maxY, (float) box.maxZ).setColor(color);
+
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.minY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.minY, (float) box.maxZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.maxX, (float) box.minY, (float) box.minZ).setColor(color);
+        vertexConsumer.addVertex(matrix, (float) box.minX, (float) box.minY, (float) box.minZ).setColor(color);
+    }
+
+    private static void setStatus(String message, int durationTicks) {
+        statusMessage = message;
+        statusUntilTick = clientTicks + durationTicks;
     }
 
     private static String formatPos(BlockPos pos) {
@@ -150,9 +360,9 @@ public final class BuildAssistClient implements ClientModInitializer {
     }
 
     private enum BuildMode {
-        NONE("NONE"),
-        LINE("LINE"),
-        AREA("AREA");
+        NONE("未選択"),
+        LINE("直線"),
+        AREA("範囲");
 
         private final String displayName;
 
@@ -169,13 +379,32 @@ public final class BuildAssistClient implements ClientModInitializer {
         }
     }
 
+    private enum PlaceResult {
+        SUCCESS,
+        RETRY,
+        SKIP
+    }
+
+    private static final class QueuedPlacement {
+        private final BlockPos pos;
+        private int retries;
+
+        private QueuedPlacement(BlockPos pos) {
+            this.pos = pos.immutable();
+        }
+    }
+
     private static final class PlacementQueue {
-        private final Deque<BlockPos> queue = new ArrayDeque<>();
+        private final Deque<QueuedPlacement> queue = new ArrayDeque<>();
         private BlockPos start;
-        private List<BlockPos> lastQueuedShape = List.of();
+        private long nextPlacementTick;
 
         private void setStart(BlockPos pos) {
             start = pos.immutable();
+        }
+
+        private BlockPos getStart() {
+            return start;
         }
 
         private boolean hasStart() {
@@ -194,40 +423,71 @@ public final class BuildAssistClient implements ClientModInitializer {
             queue.clear();
             int limit = Math.min(shape.size(), MAX_BLOCKS_PER_ACTION);
             for (int i = 0; i < limit; i++) {
-                queue.addLast(shape.get(i));
+                queue.addLast(new QueuedPlacement(shape.get(i)));
             }
 
-            lastQueuedShape = new ArrayList<>(queue);
             start = null;
+            nextPlacementTick = clientTicks;
             return limit;
+        }
+
+        private void clearSelection() {
+            start = null;
         }
 
         private void clear() {
             start = null;
             queue.clear();
-            lastQueuedShape = List.of();
+            nextPlacementTick = 0;
+        }
+
+        private int remainingCount() {
+            return queue.size();
+        }
+
+        private List<BlockPos> queuedSnapshot(int limit) {
+            List<BlockPos> positions = new ArrayList<>();
+            int count = 0;
+            for (QueuedPlacement placement : queue) {
+                positions.add(placement.pos);
+                count++;
+                if (count >= limit) {
+                    break;
+                }
+            }
+            return positions;
         }
 
         private void tick(Minecraft client) {
-            if (client.player == null || client.level == null || client.gameMode == null) {
+            if (client.player == null || client.level == null || client.gameMode == null || queue.isEmpty()) {
+                return;
+            }
+            if (clientTicks < nextPlacementTick) {
                 return;
             }
 
-            int handled = 0;
-            while (handled < BLOCKS_PER_TICK && !queue.isEmpty()) {
-                BlockPos targetPos = queue.removeFirst();
-                tryPlaceBlock(client, targetPos);
-                handled++;
+            ItemStack heldStack = client.player.getMainHandItem();
+            if (heldStack.isEmpty() || !(heldStack.getItem() instanceof BlockItem)) {
+                setStatus("設置を一時停止: ブロックを持ってください", 40);
+                nextPlacementTick = clientTicks + 10;
+                return;
             }
+
+            QueuedPlacement placement = queue.removeFirst();
+            PlaceResult result = tryPlaceBlock(client, placement.pos);
+
+            if (result == PlaceResult.RETRY) {
+                placement.retries++;
+                if (placement.retries <= MAX_RETRY_COUNT) {
+                    queue.addLast(placement);
+                }
+            }
+
+            nextPlacementTick = clientTicks + PLACE_INTERVAL_TICKS;
 
             if (queue.isEmpty()) {
-                lastQueuedShape = List.of();
+                setStatus("設置処理が完了しました", 80);
             }
-        }
-
-        @SuppressWarnings("unused")
-        private List<BlockPos> getLastQueuedShape() {
-            return Collections.unmodifiableList(lastQueuedShape);
         }
 
         private static List<BlockPos> createLine(BlockPos start, BlockPos end) {
@@ -262,8 +522,8 @@ public final class BuildAssistClient implements ClientModInitializer {
 
             List<BlockPos> positions = new ArrayList<>();
             outer:
-            for (int x = minX; x <= maxX; x++) {
-                for (int y = minY; y <= maxY; y++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int x = minX; x <= maxX; x++) {
                     for (int z = minZ; z <= maxZ; z++) {
                         positions.add(new BlockPos(x, y, z));
                         if (positions.size() >= MAX_BLOCKS_PER_ACTION) {
@@ -276,34 +536,36 @@ public final class BuildAssistClient implements ClientModInitializer {
         }
     }
 
-    private static boolean tryPlaceBlock(Minecraft client, BlockPos targetPos) {
+    private static PlaceResult tryPlaceBlock(Minecraft client, BlockPos targetPos) {
         LocalPlayer player = client.player;
         ClientLevel level = client.level;
         if (player == null || level == null || client.gameMode == null) {
-            return false;
-        }
-
-        ItemStack heldStack = player.getMainHandItem();
-        if (heldStack.isEmpty() || !(heldStack.getItem() instanceof BlockItem)) {
-            return false;
+            return PlaceResult.RETRY;
         }
 
         if (!level.getBlockState(targetPos).canBeReplaced()) {
-            return false;
+            return PlaceResult.SKIP;
         }
 
         BlockHitResult placementHit = createPlacementHitResult(level, targetPos);
         if (placementHit == null) {
-            return false;
+            return PlaceResult.RETRY;
         }
 
-        InteractionResult result = client.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, placementHit);
+        InteractionResult result;
+        internalPlacement = true;
+        try {
+            result = client.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, placementHit);
+        } finally {
+            internalPlacement = false;
+        }
+
         if (result.consumesAction()) {
             player.swing(InteractionHand.MAIN_HAND);
-            return true;
+            return PlaceResult.SUCCESS;
         }
 
-        return false;
+        return PlaceResult.RETRY;
     }
 
     private static BlockHitResult createPlacementHitResult(ClientLevel level, BlockPos targetPos) {
